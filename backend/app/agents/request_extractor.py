@@ -10,7 +10,7 @@ import google.generativeai as genai
 from app.agents.client import get_client
 from app.schemas.blood_request import BloodRequestExtraction
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are an AI assistant for a blood donor matching system in Karachi, Pakistan.
 Extract structured blood request information from messages in English, Urdu, or Roman Urdu.

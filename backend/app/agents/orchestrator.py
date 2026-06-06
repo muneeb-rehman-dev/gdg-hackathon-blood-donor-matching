@@ -23,7 +23,7 @@ from app.services.matching import get_eligible_donors
 from app.services.outreach import run_wave
 from app.services.ranking import rank_donors
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 MAX_WAVES = 5
 
 

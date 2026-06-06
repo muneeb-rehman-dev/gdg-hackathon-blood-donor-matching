@@ -9,7 +9,7 @@ import google.generativeai as genai
 from pydantic import BaseModel
 from app.agents.client import get_client
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """Classify blood donor responses. Given a reply (English, Urdu, or Roman Urdu), return JSON:
 - intent: "accepted", "rejected", or "unavailable"
