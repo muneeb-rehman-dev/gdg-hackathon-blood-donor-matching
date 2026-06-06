@@ -1,22 +1,16 @@
 """
-Blood Donor Matching Orchestrator Agent
+Blood Donor Matching Orchestrator Agent — Gemini Function Calling
 
-Uses Claude Opus 4.8 with tool use (manual agentic loop) to orchestrate
-the full blood donor matching flow:
-
-  1. Claude calls get_eligible_donors → gets ranked list
-  2. Claude calls launch_outreach_wave → triggers async simulation
-  3. Claude calls check_fulfillment_status → decides next action
-  4. Repeats until fulfilled or all donors exhausted
-
-Tools are implemented here and executed locally; Claude decides when to call them.
+Uses Gemini with function calling (tool use) to orchestrate the full
+blood donor matching flow. Gemini decides when to call each tool;
+we execute them locally and return results.
 """
 
 import json
-import uuid
 from datetime import datetime
 
-import anthropic
+import google.generativeai as genai
+from google.generativeai.protos import FunctionResponse, Part
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.client import get_client
@@ -29,86 +23,83 @@ from app.services.matching import get_eligible_donors
 from app.services.outreach import run_wave
 from app.services.ranking import rank_donors
 
-MODEL = "claude-opus-4-8"
+MODEL = "gemini-2.0-flash"
 MAX_WAVES = 5
 
 
-# ─── Tool Definitions (JSON Schema for Claude) ────────────────────────────────
+# ─── Tool Definitions ─────────────────────────────────────────────────────────
 
-TOOLS: list[anthropic.types.ToolParam] = [
-    {
-        "name": "get_eligible_donors",
-        "description": (
-            "Query the database for eligible blood donors matching the required blood group. "
-            "Returns a ranked list of donor objects sorted by proximity, eligibility, and response rate. "
-            "Call this first to see who is available."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "blood_group": {
-                    "type": "string",
-                    "description": "Blood group to search for, e.g. 'O+', 'AB-'",
-                },
-                "hospital_lat": {
-                    "type": "number",
-                    "description": "Hospital latitude for distance calculation",
-                },
-                "hospital_lng": {
-                    "type": "number",
-                    "description": "Hospital longitude for distance calculation",
-                },
-            },
-            "required": ["blood_group", "hospital_lat", "hospital_lng"],
+GET_ELIGIBLE_DONORS_DECL = genai.protos.FunctionDeclaration(
+    name="get_eligible_donors",
+    description=(
+        "Query the database for eligible blood donors matching the required blood group. "
+        "Returns a ranked list sorted by proximity, eligibility, and response rate. "
+        "Call this first to see who is available."
+    ),
+    parameters=genai.protos.Schema(
+        type=genai.protos.Type.OBJECT,
+        properties={
+            "blood_group": genai.protos.Schema(
+                type=genai.protos.Type.STRING,
+                description="Blood group e.g. 'O+', 'AB-'",
+            ),
+            "hospital_lat": genai.protos.Schema(
+                type=genai.protos.Type.NUMBER,
+                description="Hospital latitude",
+            ),
+            "hospital_lng": genai.protos.Schema(
+                type=genai.protos.Type.NUMBER,
+                description="Hospital longitude",
+            ),
         },
-    },
-    {
-        "name": "launch_outreach_wave",
-        "description": (
-            "Launch a wave of outreach to a batch of donors. "
-            "Donors will be contacted in parallel; responses arrive asynchronously. "
-            "Provide the wave_number and the list of donor IDs to contact in this wave. "
-            "Use wave_number=1 for the first wave, incrementing for each subsequent wave."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wave_number": {"type": "integer", "description": "1-based wave number"},
-                "donor_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of donor IDs to contact in this wave",
-                },
-            },
-            "required": ["wave_number", "donor_ids"],
+        required=["blood_group", "hospital_lat", "hospital_lng"],
+    ),
+)
+
+LAUNCH_OUTREACH_WAVE_DECL = genai.protos.FunctionDeclaration(
+    name="launch_outreach_wave",
+    description=(
+        "Launch a wave of outreach to a batch of donors. "
+        "Donors are contacted in parallel; responses arrive asynchronously. "
+        "Use wave_number=1 for the first wave, incrementing each time."
+    ),
+    parameters=genai.protos.Schema(
+        type=genai.protos.Type.OBJECT,
+        properties={
+            "wave_number": genai.protos.Schema(
+                type=genai.protos.Type.INTEGER,
+                description="1-based wave number",
+            ),
+            "donor_ids": genai.protos.Schema(
+                type=genai.protos.Type.ARRAY,
+                items=genai.protos.Schema(type=genai.protos.Type.STRING),
+                description="List of donor IDs to contact",
+            ),
         },
-    },
-    {
-        "name": "check_fulfillment_status",
-        "description": (
-            "Check whether the blood request has been fulfilled. "
-            "Returns confirmed donor count vs required units and overall status."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-]
+        required=["wave_number", "donor_ids"],
+    ),
+)
+
+CHECK_FULFILLMENT_DECL = genai.protos.FunctionDeclaration(
+    name="check_fulfillment_status",
+    description="Check whether the blood request has been fulfilled. Returns confirmed count vs required.",
+    parameters=genai.protos.Schema(
+        type=genai.protos.Type.OBJECT,
+        properties={},
+    ),
+)
+
+TOOLS = [genai.protos.Tool(function_declarations=[
+    GET_ELIGIBLE_DONORS_DECL,
+    LAUNCH_OUTREACH_WAVE_DECL,
+    CHECK_FULFILLMENT_DECL,
+])]
 
 
-# ─── Tool Executor ─────────────────────────────────────────────────────────────
+# ─── Orchestrator Context ──────────────────────────────────────────────────────
 
 class OrchestratorContext:
-    """Carries state across the agentic loop for a single blood request."""
-
-    def __init__(
-        self,
-        db: AsyncSession,
-        request: BloodRequest,
-        extraction: BloodRequestExtraction,
-    ) -> None:
+    def __init__(self, db: AsyncSession, request: BloodRequest, extraction: BloodRequestExtraction):
         self.db = db
         self.request = request
         self.extraction = extraction
@@ -116,71 +107,55 @@ class OrchestratorContext:
         self.contacted_donor_ids: set[str] = set()
         self.wave_count: int = 0
 
-    async def execute_tool(self, tool_name: str, tool_input: dict) -> str:
-        if tool_name == "get_eligible_donors":
-            return await self._get_eligible_donors(tool_input)
-        if tool_name == "launch_outreach_wave":
-            return await self._launch_outreach_wave(tool_input)
-        if tool_name == "check_fulfillment_status":
+    async def execute_tool(self, name: str, args: dict) -> str:
+        if name == "get_eligible_donors":
+            return await self._get_eligible_donors(args)
+        if name == "launch_outreach_wave":
+            return await self._launch_outreach_wave(args)
+        if name == "check_fulfillment_status":
             return await self._check_fulfillment_status()
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        return json.dumps({"error": f"Unknown tool: {name}"})
 
     async def _get_eligible_donors(self, inp: dict) -> str:
-        eligible = await get_eligible_donors(
-            self.db,
-            blood_group=inp["blood_group"],
-        )
+        eligible = await get_eligible_donors(self.db, blood_group=inp["blood_group"])
         self.ranked_donors = rank_donors(
             eligible,
             hospital_lat=inp["hospital_lat"],
             hospital_lng=inp["hospital_lng"],
         )
-        # Filter out already-contacted donors
         fresh = [d for d in self.ranked_donors if d.id not in self.contacted_donor_ids]
-
         return json.dumps({
             "total_eligible": len(self.ranked_donors),
             "available_for_outreach": len(fresh),
             "top_donors": [
-                {
-                    "id": d.id,
-                    "name": d.name,
-                    "area": d.area,
-                    "blood_group": d.blood_group,
-                    "distance_km": d.distance_km,
-                    "score": d.score,
-                }
-                for d in fresh[:settings.wave_size * 2]  # Show 2 waves worth
+                {"id": d.id, "name": d.name, "area": d.area,
+                 "blood_group": d.blood_group, "distance_km": d.distance_km, "score": d.score}
+                for d in fresh[:settings.wave_size * 2]
             ],
         })
 
     async def _launch_outreach_wave(self, inp: dict) -> str:
-        wave_number: int = inp["wave_number"]
-        donor_ids: list[str] = inp["donor_ids"]
-
         if self.wave_count >= MAX_WAVES:
             return json.dumps({"error": "Maximum wave limit reached."})
 
-        # Resolve donor objects
-        id_set = set(donor_ids)
+        id_set = set(inp["donor_ids"])
         wave_donors = [d for d in self.ranked_donors if d.id in id_set]
 
         if not wave_donors:
             return json.dumps({"error": "No valid donors found for given IDs."})
 
-        self.contacted_donor_ids.update(donor_ids)
+        self.contacted_donor_ids.update(inp["donor_ids"])
         self.wave_count += 1
 
-        # Update request status to in_progress on first wave
         if self.request.status == "pending":
             self.request.status = "in_progress"
             await self.db.commit()
 
-        counts = await run_wave(self.db, self.request, wave_number, wave_donors)
+        counts = await run_wave(self.db, self.request, inp["wave_number"], wave_donors)
         await self.db.refresh(self.request)
 
         return json.dumps({
-            "wave_number": wave_number,
+            "wave_number": inp["wave_number"],
             "contacted": len(wave_donors),
             "results": counts,
             "confirmed_so_far": self.request.confirmed_donors,
@@ -190,63 +165,50 @@ class OrchestratorContext:
 
     async def _check_fulfillment_status(self) -> str:
         await self.db.refresh(self.request)
-        fulfilled = self.request.confirmed_donors >= self.request.units_needed
-        remaining_donors = [
-            d for d in self.ranked_donors if d.id not in self.contacted_donor_ids
-        ]
+        remaining = [d for d in self.ranked_donors if d.id not in self.contacted_donor_ids]
         return json.dumps({
             "confirmed_donors": self.request.confirmed_donors,
             "units_needed": self.request.units_needed,
-            "fulfilled": fulfilled,
-            "remaining_eligible_donors": len(remaining_donors),
+            "fulfilled": self.request.confirmed_donors >= self.request.units_needed,
+            "remaining_eligible_donors": len(remaining),
             "waves_launched": self.wave_count,
             "max_waves": MAX_WAVES,
         })
 
 
-# ─── Main Orchestrator Entry Point ─────────────────────────────────────────────
+# ─── Main Entry Point ──────────────────────────────────────────────────────────
 
 async def run_matching_orchestrator(
     db: AsyncSession,
     request: BloodRequest,
     extraction: BloodRequestExtraction,
 ) -> None:
-    """
-    Full agentic loop — runs as a background task after the chat endpoint responds.
-    Claude drives the matching flow using tools; results stream via WebSocket.
-    """
-    client = get_client()
+    get_client()
     ctx = OrchestratorContext(db=db, request=request, extraction=extraction)
 
-    system_prompt = f"""You are an intelligent blood donor matching coordinator for an emergency medical system in Karachi.
+    system_instruction = f"""You are a blood donor matching coordinator for an emergency system in Karachi.
 
-Your goal is to fulfil the following blood request as quickly as possible:
+Blood Request Details:
 - Blood Group: {extraction.blood_group}
 - Units Needed: {extraction.units_needed}
 - Hospital: {extraction.hospital_name}, {extraction.hospital_area}
 - Urgency: {extraction.urgency_level}
 - Patient: {extraction.patient_name or 'Unknown'}
 
-You have three tools available:
-1. get_eligible_donors — find and rank available donors
-2. launch_outreach_wave — contact a batch of donors
-3. check_fulfillment_status — check if the request is fulfilled
-
 Strategy:
-- Start by calling get_eligible_donors to see who is available.
-- Launch Wave 1 with the top {settings.wave_size} highest-scored donors.
-- After the wave completes, check fulfillment status.
-- If not yet fulfilled and more donors are available, launch the next wave.
-- Stop when either: (a) confirmed_donors >= units_needed, or (b) no more eligible donors, or (c) max waves reached.
-- Be decisive — minimize idle time between waves in emergencies.
-"""
+1. Call get_eligible_donors to find available donors.
+2. Call launch_outreach_wave with the top {settings.wave_size} donor IDs (wave_number=1).
+3. Call check_fulfillment_status after each wave.
+4. If not fulfilled and donors remain, launch the next wave (increment wave_number).
+5. Stop when fulfilled OR no more donors OR max {MAX_WAVES} waves reached.
+Be decisive and minimize delays between waves."""
 
-    messages: list[anthropic.types.MessageParam] = [
-        {
-            "role": "user",
-            "content": f"Blood request created. Request ID: {request.id}. Please begin the donor matching process now.",
-        }
-    ]
+    model = genai.GenerativeModel(
+        model_name=MODEL,
+        system_instruction=system_instruction,
+        tools=TOOLS,
+        generation_config=genai.GenerationConfig(temperature=0.2),
+    )
 
     await manager.broadcast({
         "event": "status_update",
@@ -255,22 +217,18 @@ Strategy:
         "data": {"message": "Orchestrator started. Searching for eligible donors..."},
     })
 
+    chat = model.start_chat()
+    response = await chat.send_message_async(
+        f"Blood request created (ID: {request.id}). Begin donor matching now."
+    )
+
     # Agentic loop
     while True:
-        response = await client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            thinking={"type": "adaptive"},
-            system=system_prompt,
-            tools=TOOLS,
-            messages=messages,
-        )
+        # Check if Gemini wants to call a function
+        fn_calls = [p for p in response.parts if hasattr(p, "function_call") and p.function_call.name]
 
-        # Append assistant response to history
-        messages.append({"role": "assistant", "content": response.content})
-
-        if response.stop_reason == "end_turn":
-            # Claude finished — determine final status
+        if not fn_calls:
+            # No more tool calls — Gemini is done
             await db.refresh(request)
             if request.confirmed_donors >= request.units_needed:
                 request.status = "fulfilled"
@@ -292,19 +250,20 @@ Strategy:
             })
             break
 
-        if response.stop_reason != "tool_use":
-            break
+        # Execute all function calls and collect results
+        tool_response_parts = []
+        for part in fn_calls:
+            fc = part.function_call
+            args = dict(fc.args)
+            result_json = await ctx.execute_tool(fc.name, args)
 
-        # Execute all tool calls in this response
-        tool_results: list[anthropic.types.ToolResultBlockParam] = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            result_json = await ctx.execute_tool(block.name, block.input)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result_json,
-            })
+            tool_response_parts.append(
+                Part(
+                    function_response=FunctionResponse(
+                        name=fc.name,
+                        response={"result": result_json},
+                    )
+                )
+            )
 
-        messages.append({"role": "user", "content": tool_results})
+        response = await chat.send_message_async(tool_response_parts)

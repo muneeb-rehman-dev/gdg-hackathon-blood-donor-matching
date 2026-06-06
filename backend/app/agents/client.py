@@ -1,11 +1,12 @@
-import anthropic
+import google.generativeai as genai
 from app.config import settings
 
-_client: anthropic.AsyncAnthropic | None = None
+_configured = False
 
 
-def get_client() -> anthropic.AsyncAnthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    return _client
+def get_client() -> genai:
+    global _configured
+    if not _configured:
+        genai.configure(api_key=settings.gemini_api_key)
+        _configured = True
+    return genai

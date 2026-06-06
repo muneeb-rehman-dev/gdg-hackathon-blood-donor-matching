@@ -1,35 +1,24 @@
 """
-Donor Response Classifier Agent
+Donor Response Classifier Agent — Gemini Flash
 
-Uses Claude Haiku 4.5 with structured output to classify donor reply text
-into: accepted / rejected / unavailable.
-Fast and cheap — called for every simulated donor response.
+Classifies donor reply text into: accepted / rejected / unavailable.
 """
 
 import json
+import google.generativeai as genai
 from pydantic import BaseModel
 from app.agents.client import get_client
 
-MODEL = "claude-haiku-4-5"
+MODEL = "gemini-2.0-flash"
 
-SYSTEM_PROMPT = """You are classifying blood donor responses in a matching system.
-Given a donor's reply text (may be English, Urdu, or Roman Urdu), classify their intent.
+SYSTEM_PROMPT = """Classify blood donor responses. Given a reply (English, Urdu, or Roman Urdu), return JSON:
+- intent: "accepted", "rejected", or "unavailable"
+- confidence: float 0.0 to 1.0
 
-Intent options:
-- accepted: donor agrees to donate (haan, yes, okay, aa raha hoon, zaroor)
-- rejected: donor declines (nahi, no, nahi kar sakta, busy)
-- unavailable: donor is ill, out of city, has conditions preventing donation
-
-Return JSON with intent and confidence (0.0 to 1.0)."""
-
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "intent": {"type": "string", "enum": ["accepted", "rejected", "unavailable"]},
-        "confidence": {"type": "number"},
-    },
-    "required": ["intent", "confidence"],
-}
+Examples:
+"Haan zaroor aa raha hoon" -> accepted
+"Nahi kar sakta, busy hoon" -> rejected
+"Main beemaar hoon" -> unavailable"""
 
 
 class IntentClassification(BaseModel):
@@ -38,26 +27,22 @@ class IntentClassification(BaseModel):
 
 
 async def classify_donor_response(response_text: str) -> IntentClassification:
-    client = get_client()
+    get_client()
 
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=128,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": response_text}],
-        output_config={
-            "format": {
-                "type": "json_schema",
-                "name": "intent_classification",
-                "schema": RESPONSE_SCHEMA,
-                "strict": True,
-            }
-        },
+    model = genai.GenerativeModel(
+        model_name=MODEL,
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=genai.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
     )
 
-    text_content = next(
-        (block.text for block in response.content if hasattr(block, "text")),
-        '{"intent": "unavailable", "confidence": 0.5}',
-    )
-    data = json.loads(text_content)
+    response = await model.generate_content_async(response_text)
+
+    try:
+        data = json.loads(response.text)
+    except (json.JSONDecodeError, ValueError):
+        data = {"intent": "unavailable", "confidence": 0.5}
+
     return IntentClassification(**data)
